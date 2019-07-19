@@ -1,0 +1,130 @@
+## 导入函数库
+from jqdata import *
+from scipy.stats import rankdata
+from dateutil import parser
+import numpy as np
+import numpy.linalg as la  
+import pandas as pd
+from datetime import datetime
+import scipy.stats as stats
+
+# 初始化函数，设定基准等等
+def initialize(context):
+    set_benchmark('000300.XSHG')
+    set_option('use_real_price', True)
+    set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003, close_commission=0.0003, min_commission=5), type='stock')
+    log.set_level('system','error')
+    
+    g.stocks = get_index_stocks('000300.XSHG')
+    g.codes = ['601212.XSHG','600111.XSHG','002252.XSHE','000408.XSHE','601066.XSHG']
+    g.days = 0  # 设置建仓日
+    g.times = 0 # 设置每日高频范围
+    g.t = 0
+    g.buy = 0 # 买入次数
+    g.sell = 0 # 卖出次数
+    g.buy_code,g.sell_code = [],[]
+    
+    # run_daily(trade, time='every_bar', reference_security='000300.XSHG') 
+    run_daily(sell, time='14:59', reference_security='000300.XSHG')
+
+## alpha函数
+def rank(df):
+    return df.rank(pct=True,axis=1)
+def alpha42(vwap,close):
+    alpha = rank((vwap - close)) / rank((vwap + close))
+    return alpha
+    
+## 获取买卖股票列表
+# 因子前N法
+def buy_sell_list1(alpha):
+    alpha0 = alpha.iloc[-1]
+    alpha_df = pd.DataFrame(alpha0,index = g.stocks)
+    alpha_df.columns = ['alpha']
+    alpha_df = alpha_df.sort_values(['alpha'],ascending=False)
+    buy_code = list(set(alpha_df[:10].index) & set(g.codes))
+    sell_code = list(set(alpha_df[-10:].index) & set(g.codes))
+    return buy_code,sell_code
+    
+# 因子值连续增加法
+def buy_sell_list2(alpha):
+    alpha0 = alpha.iloc[-4:].T
+    alpha0.columns=['col1','col2','col3','col4']
+    alpha1 = alpha0.copy()
+    alpha1 = alpha1[alpha1.col4>alpha1.col3]
+    alpha1 = alpha1[alpha1.col3>alpha1.col2]
+    alpha1 = alpha1[alpha1.col2>alpha1.col1]
+    buy_code = list(set(g.codes) & set(alpha1.index))   
+    alpha2 = alpha0.copy()
+    alpha2 = alpha2[alpha2.col4<alpha2.col3]
+    alpha2 = alpha2[alpha2.col3<alpha2.col2]
+    alpha2 = alpha2[alpha2.col2<alpha2.col1]
+    sell_code = list(set(g.codes) & set(alpha2.index)) 
+    return buy_code,sell_code 
+    
+# N分钟均线阈值法
+def buy_sell_list3(alpha):
+    a0 = alpha.iloc[-1]
+    a1 = alpha.iloc[-2]
+    b1 = alpha.rolling(5).max()
+    b2 = b1.iloc[-1]
+    c1 = alpha.rolling(5).min()
+    c2 = c1.iloc[-1]
+    dic = {'col1':list(a0),'col2':list(a1),'col3':list(b2),'col4':list(c2)}
+    alpha_df = pd.DataFrame(dic,index = g.stocks)
+    alpha_buy = alpha_df[alpha_df.col1 > alpha_df.col3]
+    # alpha_buy = alpha_df[alpha_df.col2 < alpha_df.col3]
+    alpha_sell = alpha_df[alpha_df.col1 < alpha_df.col4]
+    # alpha_sell = alpha_df[alpha_df.col2 > alpha_df.col3]
+    buy_code = list(set(g.codes) & set(alpha_buy.index))
+    sell_code = list(set(g.codes) & set(alpha_sell.index))
+    return buy_code,sell_code
+    
+## 盘中高频交易
+def trade(context):
+    # g.t+=1
+    if g.days > 0 and g.times == 0:#and g.t%5 == 0, and g.times < 30
+        current_d = context.current_dt.strftime('%Y-%m-%d %H:%M:%S')
+        panel = get_price(g.stocks,count=7,end_date=current_d,frequency='1m',fields=['close','open','high','low','volume','avg'])
+        close = panel['close'].reset_index().drop(columns = ['index'])
+        vwap = panel['avg'].reset_index().drop(columns = ['index'])
+        alpha = alpha42(vwap,close)
+        g.buy_code,g.sell_code = buy_sell_list(alpha)
+        for code in g.buy_code:
+            order(code, 100)
+            g.buy += 1
+        # for code in g.sell_code:
+        #     order(code,-100)
+        #     g.sell+=1
+        # g.times += 1
+    if g.days > 0 and g.times == 1: 
+        for code in g.buy_code:
+            order(code, -100)
+        # for code in g.sell_code:
+        #     order(code, 100)
+        # g.times = 0
+        
+## 建仓，每日平仓        
+def sell(context):
+    print(context.portfolio.positions_value)
+    cash = context.portfolio.total_value*0.8
+    for code in g.codes:
+        order_target_value(code, cash/5)
+    g.days+=1
+    # g.times = 0
+    print(g.buy,g.sell)
+    g.buy = 0
+    g.t = 0
+    
+# current_d = context.current_dt.strftime('%Y-%m-%d %H:%M:%S')
+# panel = get_price(g.stocks,count=230,end_date=current_d,frequency='1m', fields=['close','open','high','low','volume'])
+# high = panel['high'].reset_index().drop(columns = ['index'])
+# volume = panel['volume'].reset_index().drop(columns = ['index'])
+# alpha = alpha40(high,volume)
+# max_list,min_list,g.yuzhi = [],[],[]
+# for i in range(12,len(alpha)):
+#     max_list.append(alpha.iloc[i].max())
+#     min_list.append(alpha.iloc[i].min())
+# g.yuzhi.append(pd.Series(max_list).min())
+# g.yuzhi.append(pd.Series(min_list).max())
+# print(g.yuzhi)
+   
