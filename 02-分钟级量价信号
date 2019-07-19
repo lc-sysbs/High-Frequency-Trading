@@ -1,0 +1,181 @@
+from jqdata import *
+import numpy as np
+import pandas as pd 
+import warnings
+
+warnings.filterwarnings('ignore') # 忽略警告提示
+
+def initialize(context):
+    set_option('use_real_price', True)  # 真实价格交易
+    set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003, close_commission=0.0003, min_commission=5), type='stock')
+    log.set_level('system','error')  # 取消日志
+    g.stocks = ['600111.XSHG','000553.XSHE','601066.XSHG','601162.XSHG',
+                '002939.XSHE','601828.XSHG','000876.XSHE','600703.XSHG'] # 聚宽4、5级沪深300股票池
+    set_universe(g.stocks)
+    g.num = len(g.stocks)
+    set_benchmark({'002939.XSHE':1/g.num/2,'000553.XSHE':1/g.num/2,'600111.XSHG':1/g.num/2,'600703.XSHG':1/g.num/2,
+                    '601066.XSHG':1/g.num/2,'601162.XSHG':1/g.num/2,'000876.XSHE':1/g.num/2,'601828.XSHG':1/g.num/2})
+    data = {'win':np.zeros(g.num),'equal':np.zeros(g.num),'lose':np.zeros(g.num),'times':np.zeros(g.num)}
+    g.df = pd.DataFrame(data,index = g.stocks)  
+    g.days,g.minutes = 0,0   # 建仓日，分钟计时
+    g.win,g.equal,g.lose = 0,0,0 # 交易胜负次数
+    g.times,g.times_cul,g.cost,g.amount = np.zeros(g.num),np.zeros(g.num),np.zeros(g.num),np.zeros(g.num)
+    # 每日交易次数，累计交易次数，交易成本，每次交易股票数
+    g.status = np.zeros(g.num)
+    # 股票交易状态：未交易(0)，可交易(1)，持有待平仓(2)，需马上平仓(3）
+    run_daily(trade, time='every_bar') 
+    run_daily(cover, time='14:50') 
+    run_daily(after_trade, time='15:30')
+    
+def trade(context):
+    if g.days > 0 and g.minutes < 230:
+        g.minutes += 1
+        # current_d = context.current_dt.strftime('%Y-%m-%d %H:%M:%S')
+        # 计算买入信号
+        count = max(g.minutes,56)
+        close = history(count, '1m', 'close')
+        volume = history(count, '1m', 'volume')
+        high = history(count, '1m', 'high')
+        low = history(count, '1m', 'low')
+        buy_signal(close,volume,high)
+        sell_signal(close,volume)
+        # 买卖股票，并更改其交易状态
+        for i in range(g.num):
+            stock = g.stocks[i]
+            if g.status[i] == 1 and g.times[i] <= 1: # 每日最多交易两次
+                orders = order(stock,g.amount[i])
+                if orders is None:
+                    print(str(stock)+' 下单未成功')
+                else:
+                    g.times[i] += 1
+                    g.df.loc[stock].times += 1
+                    g.cost[i] = orders.price
+                    print('买入股票:'+str(stock)+'，交易成本价为：'+str(orders.price)+'，买入数量为：'+str(orders.amount))
+                    g.status[i] = 2  # 需要平仓的股票状态
+            elif g.status[i] == 2:
+                # 止损止盈
+                current_data = get_current_data() 
+                new_price = current_data[stock].last_price  # 获取当前市价
+                if g.cost[i]*1.02 < new_price or g.cost[i]*0.98 > new_price:
+                    orders = order(stock,-1 * g.amount[i])
+                    if orders is None:
+                        print(str(stock)+' 未平仓成功')
+                    else:
+                        g.status[i] = 0
+                        if orders.price > g.cost[i]:
+                            g.win += 1
+                            g.df.loc[stock].win += 1
+                            print('平仓股票（赚）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i]))
+                        else:
+                            g.lose += 1
+                            g.df.loc[stock].lose += 1
+                            print('平仓股票（亏）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i]))
+            elif g.status[i] == 3:
+                # 离场信号
+                orders = order(stock,-1 * g.amount[i])
+                if orders is None:
+                    print(str(stock)+' 未平仓成功')
+                else:
+                    g.status[i] = 0
+                    if orders.price*1.0015 > g.cost[i]:
+                        g.win += 1
+                        g.df.loc[stock].win += 1
+                        print('平仓股票（赚）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i]))
+                    elif orders.price*1.0015 == g.cost[i]:
+                        g.equal += 1
+                        g.df.loc[stock].equal += 1
+                        print('平仓股票（平）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i]))
+                    else:
+                        g.lose += 1
+                        g.df.loc[stock].lose += 1
+                        print('平仓股票（输）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i]))
+                    
+def cover(context):
+    # 首日建仓
+    if g.days == 0:  
+        W = np.ones(g.num)/g.num/2    # get_weight(g.stocks)
+        cash_list = context.portfolio.cash * W   # 可以考虑留部分闲置资金
+        for i in range(g.num):
+            stock = g.stocks[i]
+            orders = order_value(stock,cash_list[i])
+            if orders is None:
+                    print(str(stock)+' 下单未成功')
+            else:
+                g.amount[i] = int(orders.amount/200)*100  # 向下取整
+                print(str(stock)+' 下单手数 '+str(orders.amount))
+    elif g.days > 0:
+        for i in range(g.num): 
+            stock = g.stocks[i]
+            if g.status[i] == 2:
+                orders = order(stock,-1*g.amount[i])
+                if orders is None:
+                    print(str(stock)+' 未平仓成功')
+                else:
+                    g.status[i] = 0
+                    if orders.price*1.0015 == g.cost[i]:
+                        g.equal += 1
+                        g.df.loc[stock].equal += 1
+                        print('平仓股票（平）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i]))
+                    elif orders.price*1.0015 < g.cost[i]:
+                        g.lose += 1
+                        g.df.loc[stock].lose += 1
+                        print('平仓股票（输）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i]))
+                    elif orders.price*1.0015 > g.cost[i]:
+                        g.win += 1
+                        g.df.loc[stock].win += 1
+                        print('平仓股票（输）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i]))
+            g.times_cul[i] += g.times[i]
+    
+def after_trade(context):
+    print('累计胜负情况：赢'+str(g.win)+'，平'+str(g.equal)+'，输'+str(g.lose))
+    # 每日参数清零
+    g.minutes = 0
+    g.times = np.zeros(g.num)
+    print(g.df)
+    print('='*75)
+    g.days += 1
+
+# 入场信号   
+def buy_signal(close,volume,high):
+    for i in range(g.num):
+        if g.status[i] == 0:
+            stock = g.stocks[i]
+            p1 = close[stock].iloc[-1:].values[0]
+            v1 = volume[stock].iloc[-1:].values[0]
+            p20_max = high[stock].iloc[-21:-1].max()
+            p20_mean = close[stock].iloc[-21:-1].mean()
+            p10_mean = close[stock].iloc[-11:-1].mean()
+            p55_mean = close[stock].iloc[-56:-1].mean()
+            v10 = volume[stock].iloc[-6:-1].mean()
+            v10_max = volume[stock].iloc[-6:-1].max()
+            bool_1 = p1 > p20_max and p10_mean > p20_mean > p55_mean
+            bool_2 = v1 > v10 * 2 and v1 < v10 * 4 and v1 > v10_max
+            if len(close) > 30:
+                highest = high[stock].max()  # 低于当日前N分钟最高价
+                if p1 <= highest and bool_1 and bool_2:
+                    g.status[i] += 1
+            elif bool_1 and bool_2:
+                g.status[i] += 1
+
+# 平仓信号
+def sell_signal(close,volume):
+    for i in range(g.num):
+        if g.status[i] == 2:
+            stock = g.stocks[i]
+            p1 = close[stock].iloc[-1:].values[0]
+            v1 = volume[stock].iloc[-1:].values[0]
+            v20_max = close[stock].iloc[-21:-1].max()
+            p20_mean = close[stock].iloc[-21:-1].mean()
+            p10_mean = close[stock].iloc[-11:-1].mean()
+            bool1 = p10_mean < p20_mean
+            # bool2 = v1 > v20_max and p1 < p10_mean
+            if bool1:# or bool2:
+                g.status[i] = 3
+               
+# 按市值分配股票池资金权重
+def get_weight(stocks):
+    cap = get_fundamentals(query(valuation).filter(valuation.code.in_(stocks)))['market_cap']
+    weight = []
+    for i in range(len(stocks)):
+        weight.append(cap[i]/cap.sum())
+    return np.array(weight)
