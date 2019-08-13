@@ -1,0 +1,193 @@
+# 导入函数库
+from jqdata import *
+import numpy as np
+import pandas as pd 
+import warnings
+
+warnings.filterwarnings('ignore')
+
+def initialize(context):
+    set_option('use_real_price', True)  # 真实价格交易
+    set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003,\
+    close_commission=0.0003, min_commission=5), type='stock')
+    log.set_level('system','error')  # 取消日志
+    g.stocks = ['601877.XSHG','601155.XSHG','000895.XSHE','600196.XSHG','002311.XSHE']    
+    set_universe(g.stocks)
+    g.num = len(g.stocks)
+    set_benchmark({'002939.XSHE':0}) 
+    data = {'win':np.zeros(g.num),'equal':np.zeros(g.num),
+            'lose':np.zeros(g.num),'times':np.zeros(g.num)}
+    g.df = pd.DataFrame(data,index = g.stocks)  
+    g.days,g.minutes = 0,0   # 建仓日，分钟计时
+    g.win,g.equal,g.lose = 0,0,0 # 交易胜负次数
+    g.times,g.cost,g.amount = np.zeros(g.num),np.zeros(g.num),np.zeros(g.num)
+    # 每日交易次数，累计交易次数，交易成本，每次交易股票数
+    g.status = np.zeros(g.num)
+    # 股票交易状态：未交易(0)，可交易(1)，持有待平仓(2)，需马上平仓(3）
+    g.period = np.zeros(g.num)
+    # 每只股票计时，一小时后强制卖掉
+    g.zs,g.zy = 0.02,0.03
+    g.money1,g.money2 = 0.01,0.01
+    g.length = 60
+    
+    run_daily(trade, time='every_bar') 
+    run_daily(cover, time='14:57') 
+    run_daily(after_trade, time='15:30')
+    
+def trade(context):
+    if g.days > 0 and g.minutes < 237:
+        g.minutes += 1
+        if g.minutes > 31:
+            close = history(g.minutes, '1m', 'close')
+            volume = history(g.minutes, '1m', 'volume')
+            high = history(g.minutes, '1m', 'high')
+            low = history(g.minutes, '1m', 'low')
+            dt = context.current_dt
+            current_data = get_current_data()
+            signal(close,volume,high,low,dt)
+            # 交易
+            for i in range(g.num):
+                stock = g.stocks[i]
+                new_price = current_data[stock].last_price  # 获取当前市价
+                if g.status[i] == 1 and g.times[i] < 1: # 每日最多交易次数
+                    orders = order(stock,g.amount[i])
+                    if orders is None or str(orders.status) != 'held':
+                        print(str(stock)+' 下单未成功')
+                        g.status[i] = 0
+                    else:
+                        g.times[i] += 1
+                        g.df.loc[stock].times += 1
+                        g.cost[i] = orders.price
+                        print('买入股票:'+str(stock)+'，交易成本价为：'+str(orders.price)+'，买入数量为：'+str(orders.amount))
+                        g.status[i] = 2  # 需要平仓的股票状态
+                        g.period[i] = g.minutes
+                elif g.status[i] == 2:
+                    # 止损止盈
+                    if g.cost[i]*(1+g.zy) < new_price or g.cost[i]*(1-g.zs) > new_price:
+                        orders = order(stock,-1 * g.amount[i])
+                        if orders is None or str(orders.status) != 'held':
+                            print(str(stock)+' 未平仓成功')
+                        else:
+                            g.status[i] = 0
+                            g.period[i] = 0
+                            if orders.price > g.cost[i]:
+                                g.win += 1
+                                g.df.loc[stock].win += 1
+                                print('止盈平仓股票（赚）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i])\
+                                +'，收益率为：'+str(round((orders.price-g.cost[i])/g.cost[i],3)))
+                            else:
+                                g.lose += 1
+                                g.df.loc[stock].lose += 1
+                                print('止损平仓股票（亏）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i])\
+                                +'，收益率为：'+str(round((orders.price-g.cost[i])/g.cost[i],3)))
+                elif g.status[i] == 3:
+                    # 离场信号
+                    orders = order(stock,-1 * g.amount[i])
+                    if orders is None or str(orders.status) != 'held':
+                        print(str(stock)+' 未平仓成功')
+                    else:
+                        g.status[i] = 0
+                        g.period[i] = 0
+                        if orders.price > g.cost[i]:
+                            g.win += 1
+                            g.df.loc[stock].win += 1
+                            print('平仓股票（赚）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i])\
+                            +'，收益率为：'+str(round((orders.price-g.cost[i])/g.cost[i],3)))
+                        elif orders.price == g.cost[i]:
+                            g.equal += 1
+                            g.df.loc[stock].equal += 1
+                            print('平仓股票（平）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i])\
+                            +'，收益率为：'+str(round((orders.price-g.cost[i])/g.cost[i],3)))
+                        else:
+                            g.lose += 1
+                            g.df.loc[stock].lose += 1
+                            print('平仓股票（亏）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i])\
+                            +'，收益率为：'+str(round((orders.price-g.cost[i])/g.cost[i],3)))
+                        
+def cover(context):
+    # 首日建仓
+    if g.days == 0:  
+        W = np.ones(g.num)*0.5/g.num
+        cash_list = context.portfolio.cash * W   
+        for i in range(g.num):
+            stock = g.stocks[i]
+            orders = order_value(stock,cash_list[i])
+            if orders is None or str(orders.status) != 'held':
+                print(str(stock)+' 下单未成功')
+            else:
+                g.amount[i] = int(orders.amount)
+                print(str(stock)+' 下单手数 '+str(orders.amount))
+    elif g.days > 0:
+        for i in range(g.num): 
+            stock = g.stocks[i]
+            if g.status[i] == 2:
+                orders = order(stock,-1*g.amount[i])
+                if orders is None or str(orders.status) != 'held':
+                    print(str(stock)+' 未平仓成功')
+                else:
+                    g.status[i] = 0
+                    if orders.price == g.cost[i]:
+                        g.equal += 1
+                        g.df.loc[stock].equal += 1
+                        print('尾盘平仓股票（平）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i])\
+                        +'，收益率为：'+str(round((orders.price-g.cost[i])/g.cost[i],3)))
+                    elif orders.price < g.cost[i]:
+                        g.lose += 1
+                        g.df.loc[stock].lose += 1
+                        print('尾盘平仓股票（亏）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i])\
+                        +'，收益率为：'+str(round((orders.price-g.cost[i])/g.cost[i],3)))
+                    elif orders.price > g.cost[i]:
+                        g.win += 1
+                        g.df.loc[stock].win += 1
+                        print('尾盘平仓股票（赚）:'+str(stock)+'，平仓价为：'+str(orders.price)+'，成本价为：'+str(g.cost[i])\
+                        +'，收益率为：'+str(round((orders.price-g.cost[i])/g.cost[i],3)))
+    
+def after_trade(context):
+    print('累计胜负情况：赢'+str(g.win)+'，平'+str(g.equal)+'，输'+str(g.lose))
+    # 每日参数清零
+    g.minutes = 0
+    g.times = np.zeros(g.num)
+    print(g.df)
+    print('='*75)
+    g.days += 1
+
+# 进出场信号   
+def signal(close,volume,high,low,dt):
+    for i in range(g.num):
+        stock = g.stocks[i]
+        p_open = close[stock].iloc[0]       # 开盘价
+        p1 = close[stock].iloc[-1]          # 最新价
+        p20_max = high[stock].iloc[-21:-1].max()
+        p20_mean = close[stock].iloc[-21:-1].mean()
+        p10_mean = close[stock].iloc[-11:-1].mean()
+        p5_mean = close[stock].iloc[-6:-1].mean()
+        p_min = low[stock].iloc[-31:-1].min()
+        p_max = close[stock].iloc[-31:-1].max()
+        cash_f = get_ticks(stock,dt,count=60,fields=['a1_v','b1_v','a1_p','b1_p',\
+        'a2_v','b2_v','a2_p','b2_p','a3_v','b3_v','a3_p','b3_p',\
+        'a4_v','b4_v','a4_p','b4_p','a5_v','b5_v','a5_p','b5_p'])
+        # tick级
+        a1_v,a1_p = cash_f['a1_v'][-3:],cash_f['a1_p']
+        b1_v,b1_p = cash_f['b1_v'][-3:],cash_f['b1_p']
+        a2_v,a2_p = cash_f['a2_v'][-3:],cash_f['a2_p']
+        b2_v,b2_p = cash_f['b2_v'][-3:],cash_f['b2_p']
+        a3_v,a3_p = cash_f['a3_v'][-3:],cash_f['a3_p']
+        b3_v,b3_p = cash_f['b3_v'][-3:],cash_f['b3_p']
+        a4_v,a4_p = cash_f['a4_v'][-3:],cash_f['a4_p']
+        b4_v,b4_p = cash_f['b4_v'][-3:],cash_f['b4_p']
+        a5_v,a5_p = cash_f['a5_v'][-3:],cash_f['a5_p']
+        b5_v,b5_p = cash_f['b5_v'][-3:],cash_f['b5_p']
+        if g.status[i] == 0 and g.minutes < 180:
+            bool_1 = p1 < p_min and p5_mean < p10_mean < p20_mean and p1 > p_open*0.93
+            bool_2 = b1_p[-2]+g.money1 < b1_p[-1] and b1_p[-3]+g.money2 < b1_p[-2]
+            bool_3 = (a1_v[-1]+a2_v[-1]+a3_v[-1]+a4_v[-1]+a5_v[-1])/2 < b1_v[-1]+b2_v[-1]+b3_v[-1]+b4_v[-1]+b5_v[-1]
+            bool_4 = (b1_v[-2]+b2_v[-2]+b3_v[-2]+b4_v[-2]+b5_v[-2])/2 < b1_v[-1]+b2_v[-1]+b3_v[-1]+b4_v[-1]+b5_v[-1]
+            if bool_1 and bool_2 and bool_3 and bool_4:
+                g.status[i] = 1
+        elif g.status[i] == 2:
+            bool1 = p1 > p_max and p5_mean > p10_mean > p20_mean and p1 > g.cost[i] * 1.015
+            bool2 = b1_p[-1] < b1_p[-2]
+            if g.minutes-g.period[i] > g.length:
+                g.status[i] = 3 
+            elif bool1 and bool2 or p1 > p_open*1.09:
+                g.status[i] = 3
